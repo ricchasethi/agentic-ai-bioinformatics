@@ -1,6 +1,6 @@
 # UK Biobank OLINK Batch Correction
 
-A human-in-the-loop agentic pipeline for batch effect detection and correction of UK Biobank OLINK proteomics data, built for Alzheimer's Disease biomarker discovery. Powered by [LangGraph](https://github.com/langchain-ai/langgraph) and Claude claude-sonnet-4-20250514.
+A human-in-the-loop agentic pipeline for batch effect detection and correction of UK Biobank OLINK proteomics data, built for Alzheimer's Disease biomarker discovery. Powered by [LangGraph](https://github.com/langchain-ai/langgraph) and Claude claude-sonnet-4-20250514. We generate synthetic OLINK data and test this workflow on it.
 
 ---
 
