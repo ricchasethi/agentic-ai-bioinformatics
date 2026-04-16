@@ -52,17 +52,106 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
+# ================================================================
+# REFLECTION THRESHOLDS
+# (must match CLAUDE.md §Batch severity thresholds and the values
+#  in batch_correction_agent.py / batch_correction_reflection_agent.py)
+# ================================================================
+
+_DEMO_HIGH_ETA  = 0.05
+_DEMO_HIGH_PCT  = 30.0
+_DEMO_MOD_ETA   = 0.01
+_DEMO_MOD_PCT   = 10.0
+_DEMO_DROP_ETA  = 0.001
+_DEMO_DROP_PCT  = 2.0
+
+
+def _demo_reflect(assessment: dict, confirmed: list, primary: str) -> dict:
+    """
+    Standalone reflection logic for demo mode (no LLM critique).
+
+    Classifies each confirmed batch field and returns:
+        {
+          "confirmed_for_combat": [...],
+          "demoted":              [...],
+          "dropped":              [...],
+          "primary":              str,
+          "method":               str,
+          "decisions":            [{field, action, severity, reasoning}],
+          "summary":              str,
+        }
+    """
+    decisions = []
+    for field in confirmed:
+        metrics = assessment.get(field, {})
+        eta     = metrics.get("mean_eta_sq",  metrics.get("mean_eta_squared",  0.0))
+        pct     = metrics.get("pct_affected", metrics.get("pct_proteins_affected", 0.0))
+        is_pri  = (field == primary)
+
+        if eta >= _DEMO_HIGH_ETA or pct >= _DEMO_HIGH_PCT:
+            action, severity = ("KEEP_PRIMARY" if is_pri else "KEEP_SECONDARY"), "HIGH"
+            reason = f"η²={eta:.4f}, {pct:.1f}% — HIGH. Retain for ComBat."
+        elif eta >= _DEMO_MOD_ETA or pct >= _DEMO_MOD_PCT:
+            action, severity = ("KEEP_PRIMARY" if is_pri else "KEEP_SECONDARY"), "MODERATE"
+            reason = f"η²={eta:.4f}, {pct:.1f}% — MODERATE. Retain for ComBat."
+        elif eta >= _DEMO_DROP_ETA or pct >= _DEMO_DROP_PCT:
+            action, severity = "DEMOTE_TO_COVARIATE", "LOW"
+            reason = (f"η²={eta:.4f}, {pct:.1f}% — LOW. "
+                      f"Demote '{field}' to regression covariate; ComBat would over-correct.")
+        else:
+            action, severity = "DROP", "NONE"
+            reason = (f"η²={eta:.4f}, {pct:.1f}% — NONE. "
+                      f"No detectable batch effect; dropping '{field}'.")
+
+        decisions.append({"field": field, "action": action,
+                           "severity": severity, "reasoning": reason})
+
+    combat_fields = [d["field"] for d in decisions
+                     if d["action"] in ("KEEP_PRIMARY", "KEEP_SECONDARY")]
+    demoted       = [d["field"] for d in decisions if d["action"] == "DEMOTE_TO_COVARIATE"]
+    dropped       = [d["field"] for d in decisions if d["action"] == "DROP"]
+
+    new_primary = (primary if primary in combat_fields
+                   else (combat_fields[0] if combat_fields
+                         else (demoted[0] if demoted else "")))
+
+    if combat_fields:
+        method  = "ComBat"
+        summary = (f"Reflection: {len(combat_fields)} field(s) kept for ComBat "
+                   f"({', '.join(combat_fields)}). "
+                   f"{len(demoted)} demoted ({', '.join(demoted) or 'none'}). "
+                   f"{len(dropped)} dropped ({', '.join(dropped) or 'none'}).")
+    elif demoted:
+        method  = "covariate_only"
+        summary = (f"Reflection: no field meets ComBat threshold. "
+                   f"{len(demoted)} field(s) demoted to covariate ({', '.join(demoted)}).")
+    else:
+        method  = "none"
+        summary = "Reflection: no meaningful batch effects found. No correction needed."
+
+    return {
+        "confirmed_for_combat": combat_fields,
+        "demoted":              demoted,
+        "dropped":              dropped,
+        "primary":              new_primary,
+        "method":               method,
+        "decisions":            decisions,
+        "summary":              summary,
+    }
+
+
 def demo_pipeline(data_path: str) -> None:
     """
     Full pipeline in demo mode — no LangGraph/LLM required.
     All human checkpoints use stdin/stdout.
     Identical logic to the agentic version, minus the graph infrastructure.
+    Includes the reflection step between assessment and strategy selection.
     """
     print("\n" + "="*60)
     print("DEMO MODE: Batch Correction Pipeline (stdin/stdout)")
     print("="*60)
 
-    # ── Load data ────────────────────────────────────────────
+    # ── Load data ─────────────────────────────────────────────
     print("\n[STEP 1] Loading data...")
     df = pd.read_csv(data_path)
     print(f"  Loaded: {df.shape[0]} samples × {df.shape[1]} columns")
@@ -71,13 +160,13 @@ def demo_pipeline(data_path: str) -> None:
     meta_keywords = ['eid', 'case', 'age', 'sex', 'bmi', 'apoe', 'smoking',
                       'education', 'plate', 'batch', 'centre', 'date', 'time',
                       'quality', 'freeze', 'delay', 'well', 'source', '131', '53-']
-    protein_cols = [c for c in df.columns
-                     if not any(k in c.lower() for k in meta_keywords)
-                     and pd.api.types.is_numeric_dtype(df[c])]
+    protein_cols  = [c for c in df.columns
+                      if not any(k in c.lower() for k in meta_keywords)
+                      and pd.api.types.is_numeric_dtype(df[c])]
     metadata_cols = [c for c in df.columns if c not in protein_cols]
     print(f"  Proteins: {len(protein_cols)} | Metadata: {len(metadata_cols)}")
 
-    # ── Detect batch fields (heuristic in demo mode) ─────────
+    # ── Detect batch fields (heuristic in demo mode) ──────────
     print("\n[STEP 2] Detecting batch-relevant fields...")
     batch_keywords = ['plate', 'batch', 'well', 'centre', 'center', 'date',
                        'time', 'quality', 'freeze', 'delay', 'flag']
@@ -94,8 +183,9 @@ def demo_pipeline(data_path: str) -> None:
             candidate_fields[col] = {
                 "n_unique": n_unique,
                 "dtype":    str(df[col].dtype),
-                "category": "primary_batch" if "plate" in col_lower or "batch" in col_lower
-                              else "secondary_batch"
+                "category": ("primary_batch"
+                              if "plate" in col_lower or "batch" in col_lower
+                              else "secondary_batch")
             }
 
     print("\n  Detected batch-relevant fields:")
@@ -106,25 +196,59 @@ def demo_pipeline(data_path: str) -> None:
     print("\n" + "─"*60)
     print("HUMAN CHECKPOINT 1: Confirm Batch Fields")
     print("─"*60)
-    print("  Detected fields listed above.")
-    print(f"  Suggested primary batch field: "
-          f"{next((c for c in candidate_fields if 'plate' in c.lower()), list(candidate_fields.keys())[0] if candidate_fields else 'none')}")
-    print("\n  Press ENTER to accept all, or type comma-separated field names to use:")
+
+    all_candidate_names = list(candidate_fields.keys())
+    default_primary = next(
+        (c for c in candidate_fields if 'plate' in c.lower()),
+        all_candidate_names[0] if all_candidate_names else 'none'
+    )
+    print(f"\n  Suggested primary: {default_primary}")
+    print(f"  All candidates:    {all_candidate_names}")
+    print("""
+  How to respond:
+    ENTER                      accept all fields as-is
+    drop: f1, f2               drop the named fields, keep the rest
+    keep: f1, f2  (or f1, f2)  keep only the named fields
+  """)
     user_input = input("  > ").strip()
 
-    if user_input:
-        confirmed = [f.strip() for f in user_input.split(",")
-                      if f.strip() in df.columns]
+    if not user_input:
+        confirmed = all_candidate_names
+
+    elif user_input.lower().startswith("drop:"):
+        to_drop   = {f.strip() for f in user_input[5:].split(",")}
+        unknown   = to_drop - set(all_candidate_names)
+        if unknown:
+            print(f"  ⚠  Unknown field(s) ignored: {sorted(unknown)}")
+        confirmed = [f for f in all_candidate_names if f not in to_drop]
+
+    elif user_input.lower().startswith("keep:"):
+        to_keep   = [f.strip() for f in user_input[5:].split(",")]
+        confirmed = [f for f in to_keep if f in df.columns]
+
     else:
-        confirmed = list(candidate_fields.keys())
+        # Plain comma-separated = keep list
+        to_keep   = [f.strip() for f in user_input.split(",")]
+        confirmed = [f for f in to_keep if f in df.columns]
 
-    print("\n  Enter the PRIMARY batch field for ComBat (for plate-level correction):")
-    primary = input("  > ").strip()
-    if primary not in df.columns:
-        primary = confirmed[0] if confirmed else ""
+    dropped_by_human = [f for f in all_candidate_names if f not in confirmed]
+    if dropped_by_human:
+        print(f"  ✗ Dropped: {dropped_by_human}")
 
-    print(f"\n  ✓ Confirmed: {confirmed}")
-    print(f"  ✓ Primary:   {primary}")
+    # Derive primary — auto-promote if original was dropped
+    if default_primary in confirmed:
+        primary = default_primary
+    elif confirmed:
+        primary = confirmed[0]
+        if default_primary not in confirmed:
+            print(f"  ⚠  Primary '{default_primary}' was dropped. "
+                  f"Auto-promoted '{primary}' to primary.")
+    else:
+        primary = ""
+        print("  ⚠  All fields dropped — no batch correction will run.")
+
+    print(f"\n  ✓ Confirmed ({len(confirmed)}): {confirmed}")
+    print(f"  ✓ Primary:               {primary}")
 
     # ── Assess batch effects ──────────────────────────────────
     print("\n[STEP 3] Assessing batch effects...")
@@ -134,7 +258,7 @@ def demo_pipeline(data_path: str) -> None:
     for batch_field in confirmed:
         if batch_field not in df.columns:
             continue
-        is_cat = df[batch_field].dtype == object or df[batch_field].nunique() < 50
+        is_cat   = df[batch_field].dtype == object or df[batch_field].nunique() < 50
         eta_vals, p_vals = [], []
 
         for prot in protein_cols[:150]:  # sample for speed
@@ -147,11 +271,11 @@ def demo_pipeline(data_path: str) -> None:
                 groups = [y[x == c].values for c in x.unique() if len(y[x == c]) > 2]
                 if len(groups) < 2:
                     continue
-                _, p    = stats.f_oneway(*groups)
-                grand   = y.mean()
-                ss_b    = sum(len(g)*(g.mean()-grand)**2 for g in groups)
-                ss_t    = ((y-grand)**2).sum()
-                eta_sq  = float(ss_b/ss_t) if ss_t > 0 else 0
+                _, p   = stats.f_oneway(*groups)
+                grand  = y.mean()
+                ss_b   = sum(len(g)*(g.mean()-grand)**2 for g in groups)
+                ss_t   = ((y-grand)**2).sum()
+                eta_sq = float(ss_b/ss_t) if ss_t > 0 else 0
             else:
                 try:
                     x_num = pd.to_numeric(x, errors='coerce').dropna()
@@ -177,9 +301,9 @@ def demo_pipeline(data_path: str) -> None:
             severity = "LOW"
 
         assessment[batch_field] = {
-            "pct_affected": pct_affected,
-            "mean_eta_sq":  mean_eta,
-            "severity":     severity
+            "pct_affected":  pct_affected,
+            "mean_eta_sq":   mean_eta,
+            "severity":      severity
         }
         print(f"  {batch_field:<30} {pct_affected:5.1f}% affected | "
               f"η²={mean_eta:.4f} | {severity}")
@@ -188,25 +312,42 @@ def demo_pipeline(data_path: str) -> None:
     _demo_pca_plot(df, protein_cols, primary, "results/batch/pca_before.png",
                     "PCA — Before Batch Correction")
 
+    # ── REFLECTION STEP ───────────────────────────────────────
+    print("\n[STEP 3b] Reflection agent reviewing assessment...")
+    reflect = _demo_reflect(assessment, confirmed, primary)
+
+    print(f"\n  {reflect['summary']}")
+    print("\n  Per-field decisions:")
+    for d in reflect["decisions"]:
+        print(f"    {d['field']:<35} → {d['action']:<25} ({d['severity']})")
+        print(f"       {d['reasoning']}")
+
+    # Update confirmed/primary based on reflection
+    confirmed = reflect["confirmed_for_combat"] or reflect["demoted"]
+    primary   = reflect["primary"]
+    suggested = reflect["method"]
+
     # ── HUMAN CHECKPOINT 2 ────────────────────────────────────
     print("\n" + "─"*60)
     print("HUMAN CHECKPOINT 2: Approve Correction Strategy")
     print("─"*60)
 
-    max_pct = max((a["pct_affected"] for a in assessment.values()), default=0)
-    suggested = "ComBat" if max_pct > 10 else "covariate_only"
-
-    print(f"\n  Based on assessment, AI suggests: {suggested}")
-    print(f"  Primary batch variable: {primary}")
+    print(f"\n  Reflection agent recommends: {suggested}")
+    print(f"  ComBat fields:        {reflect['confirmed_for_combat']}")
+    print(f"  Demoted to covariate: {reflect['demoted']}")
+    print(f"  Dropped:              {reflect['dropped']}")
+    print(f"  Primary batch var:    {primary}")
     print(f"  Biological covariates to protect: age, sex, AD_case, apoe_e4")
     print("\n  Options:")
     print("    [1] ComBat correction (recommended if severity HIGH/MODERATE)")
     print("    [2] Covariate-only (include batch as regression covariate)")
     print("    [3] No correction")
-    choice = input("\n  Enter choice [1/2/3, default=1]: ").strip() or "1"
+
+    default_choice = "1" if suggested == "ComBat" else ("2" if suggested == "covariate_only" else "3")
+    choice = input(f"\n  Enter choice [1/2/3, default={default_choice}]: ").strip() or default_choice
 
     method_map = {"1": "ComBat", "2": "covariate_only", "3": "none"}
-    method = method_map.get(choice, "ComBat")
+    method = method_map.get(choice, suggested)
     print(f"\n  ✓ Approved method: {method}")
 
     # ── Apply correction ──────────────────────────────────────
@@ -218,7 +359,7 @@ def demo_pipeline(data_path: str) -> None:
         df_corrected = _apply_demo_combat(df, protein_cols, primary, protect_vars)
     else:
         df_corrected = df.copy()
-        print("  No data transformation applied (covariate-only mode).")
+        print("  No data transformation applied (covariate-only / no-correction mode).")
 
     # ── Validate ──────────────────────────────────────────────
     print("\n[STEP 5] Validating correction...")
@@ -262,6 +403,7 @@ def demo_pipeline(data_path: str) -> None:
             "primary_batch":     primary,
             "confirmed_fields":  confirmed,
             "assessment":        assessment,
+            "reflection":        reflect,
             "validation":        metrics
         }
         with open("results/batch/audit_trail.json", "w") as f:
@@ -284,17 +426,17 @@ def _apply_demo_combat(df, protein_cols, batch_col, protect_vars):
     df_corrected[protein_cols] = imputer.fit_transform(df_corrected[protein_cols])
 
     grand_means = df_corrected[protein_cols].mean()
-    batches = df_corrected[batch_col].unique()
+    batches     = df_corrected[batch_col].unique()
 
     for batch_val in batches:
         mask = df_corrected[batch_col] == batch_val
-        n    = mask.sum()
-        if n < 2:
+        if mask.sum() < 2:
             continue
         batch_means = df_corrected.loc[mask, protein_cols].mean()
         shift = grand_means - batch_means
-        df_corrected.loc[mask, protein_cols] = \
+        df_corrected.loc[mask, protein_cols] = (
             df_corrected.loc[mask, protein_cols].add(shift)
+        )
 
     print(f"  Applied mean-centering per batch ({len(batches)} batches).")
     print("  NOTE: In production use pyComBat (pip install inmoose) for full ComBat.")
@@ -305,7 +447,7 @@ def _demo_validate(df_raw, df_corrected, protein_cols, batch_col):
     """Compute validation metrics."""
     eta_before, eta_after = [], []
     marker_effects = {}
-    known_markers = ['NEFL', 'GFAP', 'TREM2', 'CLU', 'APOE', 'APP']
+    known_markers  = ['NEFL', 'GFAP', 'TREM2', 'CLU', 'APOE', 'APP']
 
     for prot in protein_cols[:100]:
         for df_, store in [(df_raw, eta_before), (df_corrected, eta_after)]:
@@ -378,7 +520,7 @@ def _demo_pca_plot(df, protein_cols, colour_col, save_path, title):
 def _demo_before_after_plot(df_raw, df_corrected, protein_cols, batch_col):
     """Side-by-side before/after PCA."""
     try:
-        valid = [p for p in protein_cols if p in df_raw.columns][:200]
+        valid    = [p for p in protein_cols if p in df_raw.columns][:200]
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
         for ax, df_, title in [
@@ -442,7 +584,7 @@ def main():
         print("Running in DEMO MODE (no LLM, no LangGraph).")
         demo_pipeline(data_path)
     else:
-        # Full LangGraph agentic pipeline
+        # Full LangGraph agentic pipeline (reflection node is built into the graph)
         from batch_correction_agent import run_pipeline
         run_pipeline(data_path, thread_id=args.thread)
 

@@ -5,10 +5,11 @@ UK Biobank OLINK Proteomics Data
 ================================================================
 
 Architecture:
-  LangGraph StateGraph with 8 nodes + 3 human approval checkpoints
+  LangGraph StateGraph with 9 nodes + 3 human approval checkpoints
 
   [load_data] → [detect_batch_fields] → [HUMAN: confirm fields]
-      → [assess_batch_effects] → [HUMAN: approve correction strategy]
+      → [assess_batch_effects] → [reflect_on_assessment]
+      → [propose_strategy] → [HUMAN: approve correction strategy]
       → [apply_correction] → [validate_correction]
       → [HUMAN: accept/reject results] → [save_outputs]
 
@@ -20,6 +21,8 @@ Key rules enforced here:
   - All dicts stored in state must pass through _sanitise() first
   - ComBat covar_mod must always include AD_case, age, sex
   - QC order: filter → winsorise → impute → batch correct → INT → analyse
+  - Reflection node sits between assess_batch_effects and propose_strategy;
+    it prunes fields with no detectable batch effect before strategy is set
 
 Dependencies:
     pip install langgraph langchain langchain-anthropic
@@ -84,6 +87,9 @@ class BatchCorrectionState(TypedDict):
     batch_assessment: dict             # {field: {pct_affected, mean_eta_sq, ...}}
     assessment_plots: list[str]        # paths to generated plots
     correction_needed: bool
+
+    # --- Reflection ---
+    reflection_log: list[dict]         # per-round reflection audit trail
 
     # --- Correction strategy ---
     proposed_strategy: dict            # AI-proposed strategy with reasoning
@@ -350,10 +356,10 @@ Return ONLY valid JSON in this exact format:
 
 def _heuristic_batch_classification(col_summaries: dict) -> dict:
     """Fallback heuristic when LLM is unavailable."""
-    PLATE_KEYWORDS = ['plate', 'batch', 'lot']
+    PLATE_KEYWORDS   = ['plate', 'batch', 'lot']
     SPATIAL_KEYWORDS = ['well', 'row', 'column', 'position']
-    TIME_KEYWORDS = ['date', 'time', 'day']
-    CENTRE_KEYWORDS = ['centre', 'center', 'site', 'location']
+    TIME_KEYWORDS    = ['date', 'time', 'day']
+    CENTRE_KEYWORDS  = ['centre', 'center', 'site', 'location']
     QUALITY_KEYWORDS = ['quality', 'haemo', 'freeze', 'delay', 'flag']
 
     classifications = {}
@@ -392,17 +398,38 @@ def human_confirm_batch_fields(state: BatchCorrectionState) -> BatchCorrectionSt
     Human-in-the-loop checkpoint 1.
     Shows AI-detected batch fields and asks human to confirm/modify.
     Uses LangGraph interrupt() for async suspension.
+
+    Accepted response formats
+    -------------------------
+    1. JSON (full control):
+         {"confirmed_fields": ["plate_id", "assessment_centre"],
+          "primary_batch_field": "plate_id",
+          "notes": "dropped freeze_thaw_cycles — not meaningful here"}
+
+    2. Keep list  — comma-separated field names to KEEP (all others dropped):
+         plate_id, assessment_centre
+
+    3. Drop prefix — comma-separated field names to DROP (all others kept):
+         drop: freeze_thaw_cycles, sample_quality_flag
+
+    4. Empty / ENTER — accept all AI-detected fields as-is.
+
+    Dropping the nominated primary field automatically promotes the
+    next surviving field to primary and logs a warning.
     """
     print("\n" + "="*60)
     print("HUMAN CHECKPOINT 1: Confirm Batch Fields")
     print("="*60)
 
-    candidates = state["candidate_batch_fields"]
+    candidates    = state["candidate_batch_fields"]
+    all_names     = list(candidates.keys())
+    ai_primary    = state.get("primary_batch_field", all_names[0] if all_names else "")
 
-    # Format the decision request for the human
+    # ── Build display ─────────────────────────────────────────
     display = "\nAI-detected batch-relevant fields:\n"
     for i, (col, info) in enumerate(candidates.items()):
-        display += (f"\n  [{i+1}] {col}\n"
+        primary_marker = "  ← suggested primary" if col == ai_primary else ""
+        display += (f"\n  [{i+1}] {col}{primary_marker}\n"
                     f"       Category:   {info['category']}\n"
                     f"       Confidence: {info['confidence']:.0%}\n"
                     f"       N unique:   {info['n_unique']}\n"
@@ -410,51 +437,155 @@ def human_confirm_batch_fields(state: BatchCorrectionState) -> BatchCorrectionSt
 
     display += "\nAI Reasoning:\n" + "\n".join(state["agent_reasoning"][-3:])
 
-    # Suspend execution and wait for human input via interrupt()
+    display += f"""
+
+HOW TO RESPOND:
+  • ENTER (empty)         — accept all {len(all_names)} fields as-is
+  • keep: f1, f2          — keep only the named fields (all others dropped)
+  • drop: f1, f2          — drop the named fields (all others kept)
+  • JSON object           — full control:
+      {{"confirmed_fields": {json.dumps(all_names[:2])},
+       "primary_batch_field": "{all_names[0] if all_names else ''}",
+       "notes": "reason for any changes"}}
+
+  Fields not in confirmed_fields are EXCLUDED from all downstream steps.
+  To change the primary batch field (used for ComBat), set primary_batch_field.
+"""
+
+    # ── Suspend for human input ───────────────────────────────
     human_response = interrupt({
-        "checkpoint": "confirm_batch_fields",
-        "message": display,
+        "checkpoint":       "confirm_batch_fields",
+        "message":          display,
         "candidate_fields": candidates,
-        "instructions": (
-            "Please review the detected batch fields. "
-            "Respond with a JSON object: "
-            "{'confirmed_fields': ['col1', 'col2'], "
-            "'primary_batch_field': 'col1', "
-            "'notes': 'any comments'}"
-        )
+        "all_field_names":  all_names,
+        "suggested_primary": ai_primary,
+        "instructions":     display,
     })
 
-    # Process human response
-    if isinstance(human_response, str):
-        try:
-            response_data = json.loads(human_response)
-        except json.JSONDecodeError:
-            # If human just typed field names as comma-separated
-            confirmed = [f.strip() for f in human_response.split(",")]
-            response_data = {
-                "confirmed_fields": confirmed,
-                "primary_batch_field": confirmed[0] if confirmed else "",
-                "notes": ""
-            }
-    else:
-        response_data = human_response
+    # ── Parse response ────────────────────────────────────────
+    notes    = ""
+    warnings = []
 
-    confirmed   = response_data.get("confirmed_fields", list(candidates.keys()))
-    primary     = response_data.get("primary_batch_field",
-                                     confirmed[0] if confirmed else "")
+    if isinstance(human_response, str):
+        raw = human_response.strip()
+
+        if not raw:
+            # Empty → accept all
+            confirmed = all_names
+            notes     = "Accepted all AI-detected fields."
+
+        elif raw.lower().startswith("drop:"):
+            # drop: field1, field2
+            to_drop   = {f.strip() for f in raw[5:].split(",")}
+            unknown   = to_drop - set(all_names)
+            if unknown:
+                warnings.append(f"Unknown field(s) in drop list (ignored): {sorted(unknown)}")
+            confirmed = [f for f in all_names if f not in to_drop]
+            notes     = f"Dropped: {sorted(to_drop - unknown)}"
+
+        elif raw.lower().startswith("keep:"):
+            # keep: field1, field2  (explicit keep prefix)
+            to_keep   = [f.strip() for f in raw[5:].split(",")]
+            unknown   = set(to_keep) - set(all_names)
+            if unknown:
+                warnings.append(f"Unknown field(s) in keep list (ignored): {sorted(unknown)}")
+            confirmed = [f for f in to_keep if f in all_names]
+            notes     = f"Kept only: {confirmed}"
+
+        else:
+            # Try JSON first
+            try:
+                response_data = json.loads(raw)
+                confirmed     = response_data.get("confirmed_fields", all_names)
+                notes         = response_data.get("notes", "")
+                # primary handled below via response_data
+                primary = response_data.get(
+                    "primary_batch_field",
+                    confirmed[0] if confirmed else ""
+                )
+                # Validate confirmed against known columns
+                df = _load_df(state["df_current_path"])
+                confirmed = [f for f in confirmed if f in df.columns]
+                _finalise_checkpoint(
+                    state, confirmed, primary, notes, warnings,
+                    ai_primary, display, human_response
+                )
+                return state
+            except json.JSONDecodeError:
+                # Plain comma-separated = keep list (no prefix)
+                to_keep   = [f.strip() for f in raw.split(",")]
+                unknown   = set(to_keep) - set(all_names)
+                if unknown:
+                    warnings.append(
+                        f"Unknown field(s) in keep list (ignored): {sorted(unknown)}"
+                    )
+                confirmed = [f for f in to_keep if f in all_names]
+                notes     = f"Kept only: {confirmed}"
+
+    else:
+        # Dict passed directly (programmatic / test use)
+        response_data = human_response if isinstance(human_response, dict) else {}
+        confirmed     = response_data.get("confirmed_fields", all_names)
+        notes         = response_data.get("notes", "")
+        primary       = response_data.get(
+            "primary_batch_field", confirmed[0] if confirmed else ""
+        )
+        _finalise_checkpoint(
+            state, confirmed, primary, notes, warnings,
+            ai_primary, display, human_response
+        )
+        return state
+
+    # ── Derive primary from surviving fields ──────────────────
+    if ai_primary in confirmed:
+        primary = ai_primary
+    elif confirmed:
+        primary = confirmed[0]
+        if ai_primary:
+            warnings.append(
+                f"Nominated primary '{ai_primary}' was dropped. "
+                f"Auto-promoted '{primary}' to primary."
+            )
+    else:
+        primary = ""
+        warnings.append("All fields were dropped — no batch correction will run.")
+
+    _finalise_checkpoint(
+        state, confirmed, primary, notes, warnings,
+        ai_primary, display, human_response
+    )
+    return state
+
+
+def _finalise_checkpoint(state, confirmed, primary, notes, warnings,
+                          ai_primary, display, raw_response):
+    """Write confirmed fields, primary, and audit record back to state."""
+    dropped = [f for f in state["candidate_batch_fields"] if f not in confirmed]
+
+    if warnings:
+        print("\n  ⚠  Warnings:")
+        for w in warnings:
+            print(f"     {w}")
+
+    print(f"\n  ✓ Confirmed fields ({len(confirmed)}): {confirmed}")
+    if dropped:
+        print(f"  ✗ Dropped fields   ({len(dropped)}): {dropped}")
+    print(f"  ✓ Primary batch field: {primary}")
+    if notes:
+        print(f"  ✎ Notes: {notes}")
 
     state["confirmed_batch_fields"] = confirmed
     state["primary_batch_field"]    = primary
     state["human_decisions"].append({
-        "checkpoint": "confirm_batch_fields",
-        "input":      display,
-        "response":   response_data
+        "checkpoint":        "confirm_batch_fields",
+        "input":             display,
+        "response":          raw_response,
+        "confirmed_fields":  confirmed,
+        "dropped_fields":    dropped,
+        "primary":           primary,
+        "notes":             notes,
+        "warnings":          warnings,
     })
-
-    print(f"\n  Human confirmed fields: {confirmed}")
-    print(f"  Primary batch field:    {primary}")
-
-    return state
 
 
 # ================================================================
@@ -481,7 +612,7 @@ def node_assess_batch_effects(state: BatchCorrectionState) -> BatchCorrectionSta
         if batch_field not in df.columns:
             continue
 
-        batch_var    = df[batch_field]
+        batch_var      = df[batch_field]
         is_categorical = bool(df[batch_field].dtype == object or
                                df[batch_field].nunique() < 50)
 
@@ -525,11 +656,11 @@ def node_assess_batch_effects(state: BatchCorrectionState) -> BatchCorrectionSta
             severity = "LOW — covariate adjustment sufficient"
 
         assessment[batch_field] = {
-            "pct_proteins_affected": pct_affected,
-            "mean_eta_squared":      mean_eta_sq,
-            "n_proteins_significant":n_sig,
-            "severity":              severity,
-            "is_categorical":        is_categorical
+            "pct_proteins_affected":  pct_affected,
+            "mean_eta_squared":       mean_eta_sq,
+            "n_proteins_significant": n_sig,
+            "severity":               severity,
+            "is_categorical":         is_categorical
         }
 
         print(f"  {batch_field}: {pct_affected:.1f}% proteins affected | "
@@ -547,15 +678,15 @@ def node_assess_batch_effects(state: BatchCorrectionState) -> BatchCorrectionSta
         for a in assessment.values()
     )
 
-    state["batch_assessment"]   = _sanitise(assessment)
-    state["assessment_plots"]   = plot_paths
-    state["correction_needed"]  = bool(correction_needed)
+    state["batch_assessment"]  = _sanitise(assessment)
+    state["assessment_plots"]  = plot_paths
+    state["correction_needed"] = bool(correction_needed)
     state["agent_reasoning"].append(
         f"Batch assessment complete. Correction needed: {correction_needed}. "
         f"Fields assessed: {list(assessment.keys())}"
     )
 
-    # Update df_current_path (df unchanged in this node, but re-save to be explicit)
+    # Re-save df_current so subsequent nodes see a consistent path
     state["df_current_path"] = _save_df(df, "df_current")
 
     return state
@@ -600,18 +731,354 @@ def _plot_batch_pca(df, protein_cols, colour_col, save_path):
 
 
 # ================================================================
-# NODE 4: PROPOSE CORRECTION STRATEGY (AI Agent)
+# NODE 4: REFLECT ON ASSESSMENT (Reflection Agent)
+# ================================================================
+
+# Thresholds — must match CLAUDE.md §Batch severity thresholds
+_REFLECT_HIGH_ETA  = 0.05
+_REFLECT_HIGH_PCT  = 30.0
+_REFLECT_MOD_ETA   = 0.01
+_REFLECT_MOD_PCT   = 10.0
+_REFLECT_DROP_ETA  = 0.001
+_REFLECT_DROP_PCT  = 2.0
+_MAX_REFLECT_ROUNDS = 3
+
+
+def _classify_field_reflect(field_name: str, metrics: dict, is_primary: bool) -> dict:
+    """
+    Classify one batch field into KEEP_PRIMARY | KEEP_SECONDARY |
+    DEMOTE_TO_COVARIATE | DROP based on its η² and pct_affected.
+    """
+    eta = metrics.get("mean_eta_squared",      0.0)
+    pct = metrics.get("pct_proteins_affected", 0.0)
+
+    if eta >= _REFLECT_HIGH_ETA or pct >= _REFLECT_HIGH_PCT:
+        severity = "HIGH"
+        action   = "KEEP_PRIMARY" if is_primary else "KEEP_SECONDARY"
+        reasoning = (
+            f"η²={eta:.4f}, {pct:.1f}% proteins — HIGH. "
+            f"{'Primary ComBat variable confirmed.' if is_primary else 'Retain as secondary ComBat covariate.'}"
+        )
+    elif eta >= _REFLECT_MOD_ETA or pct >= _REFLECT_MOD_PCT:
+        severity  = "MODERATE"
+        action    = "KEEP_PRIMARY" if is_primary else "KEEP_SECONDARY"
+        reasoning = (
+            f"η²={eta:.4f}, {pct:.1f}% proteins — MODERATE. "
+            f"{'ComBat on this primary variable is recommended.' if is_primary else 'Retain as secondary batch covariate.'}"
+        )
+    elif eta >= _REFLECT_DROP_ETA or pct >= _REFLECT_DROP_PCT:
+        severity  = "LOW"
+        action    = "DEMOTE_TO_COVARIATE"
+        reasoning = (
+            f"η²={eta:.4f}, {pct:.1f}% proteins — LOW. "
+            f"ComBat would risk over-correction; include '{field_name}' as regression covariate only."
+        )
+    else:
+        severity  = "NONE"
+        action    = "DROP"
+        reasoning = (
+            f"η²={eta:.4f}, {pct:.1f}% proteins — NONE. "
+            f"No detectable batch effect; dropping '{field_name}' entirely."
+        )
+
+    return {"field": field_name, "action": action,
+            "severity": severity, "reasoning": reasoning}
+
+
+def _build_revised_plan_reflect(decisions: list[dict],
+                                original_primary: str) -> dict:
+    """Derive revised field lists and correction method from per-field decisions."""
+    keep    = [d for d in decisions if d["action"] in ("KEEP_PRIMARY", "KEEP_SECONDARY")]
+    demoted = [d["field"] for d in decisions if d["action"] == "DEMOTE_TO_COVARIATE"]
+    dropped = [d["field"] for d in decisions if d["action"] == "DROP"]
+
+    combat_fields = [d["field"] for d in keep]
+
+    if original_primary in combat_fields:
+        new_primary = original_primary
+    elif combat_fields:
+        new_primary = combat_fields[0]
+    else:
+        new_primary = demoted[0] if demoted else ""
+
+    if combat_fields:
+        method  = "ComBat"
+        overall = (
+            f"After reflection, {len(combat_fields)} field(s) retain sufficient "
+            f"batch signal for ComBat ({', '.join(combat_fields)}). "
+            f"{len(demoted)} demoted to covariate ({', '.join(demoted) or 'none'}). "
+            f"{len(dropped)} dropped ({', '.join(dropped) or 'none'})."
+        )
+    elif demoted:
+        method  = "covariate_only"
+        overall = (
+            f"No field meets the ComBat threshold. "
+            f"Surviving fields ({', '.join(demoted)}) have LOW batch effect "
+            f"and will be included as regression covariates only."
+        )
+    else:
+        method  = "none"
+        overall = (
+            "Reflection finds NO meaningful batch effects across all confirmed "
+            "fields. No batch correction is required."
+        )
+
+    return {
+        "confirmed_batch_fields": combat_fields,
+        "primary_batch_field":    new_primary,
+        "demoted_fields":         demoted,
+        "dropped_fields":         dropped,
+        "recommended_method":     method,
+        "overall_reasoning":      overall,
+    }
+
+
+def _reassess_field_reflect(df: pd.DataFrame, protein_cols: list[str],
+                             batch_field: str, sample_n: int = 150) -> dict:
+    """
+    Lightweight re-computation of η² for a single batch field.
+    Used during reflection rounds 2-N after the field list has changed.
+    """
+    if batch_field not in df.columns:
+        return {"mean_eta_squared": 0.0, "pct_proteins_affected": 0.0,
+                "severity": "NONE", "is_categorical": False}
+
+    is_categorical = bool(
+        df[batch_field].dtype == object or df[batch_field].nunique() < 50
+    )
+    batch_var = df[batch_field]
+    eta_vals, p_vals = [], []
+
+    for prot in protein_cols[:sample_n]:
+        if prot not in df.columns:
+            continue
+        y = df[prot].dropna()
+        x = batch_var.loc[y.index].dropna()
+        y = y.loc[x.index]
+        if len(y) < 20:
+            continue
+        if is_categorical:
+            groups = [y[x == cat].values for cat in x.unique() if len(y[x == cat]) > 2]
+            if len(groups) < 2:
+                continue
+            _, p_val = stats.f_oneway(*groups)
+            grand    = y.mean()
+            ss_b     = sum(len(g) * (g.mean() - grand) ** 2 for g in groups)
+            ss_t     = ((y - grand) ** 2).sum()
+            eta_vals.append(float(ss_b / ss_t) if ss_t > 0 else 0.0)
+        else:
+            rho, p_val = stats.spearmanr(x, y)
+            eta_vals.append(float(rho ** 2))
+        p_vals.append(float(p_val))
+
+    n_sig        = int(sum(p < 0.05 for p in p_vals))
+    pct_affected = float(n_sig / max(len(protein_cols), 1) * 100)
+    mean_eta     = float(np.mean(eta_vals)) if eta_vals else 0.0
+
+    if mean_eta >= _REFLECT_HIGH_ETA or pct_affected >= _REFLECT_HIGH_PCT:
+        severity = "HIGH — ComBat correction required"
+    elif mean_eta >= _REFLECT_MOD_ETA or pct_affected >= _REFLECT_MOD_PCT:
+        severity = "MODERATE — ComBat recommended"
+    else:
+        severity = "LOW — covariate adjustment sufficient"
+
+    return {
+        "mean_eta_squared":       mean_eta,
+        "pct_proteins_affected":  pct_affected,
+        "n_proteins_significant": n_sig,
+        "severity":               severity,
+        "is_categorical":         is_categorical,
+    }
+
+
+def _llm_reflect_critique(assessment: dict, decisions: list[dict],
+                           revised_plan: dict, round_num: int) -> str:
+    """
+    Ask the LLM to critique the automated reflection decisions.
+    Returns a plain-text paragraph.  Falls back gracefully on API failure.
+    """
+    llm = get_llm()
+    prompt = f"""
+You are reviewing an automated batch-effect reflection decision for UK Biobank
+OLINK proteomics data.
+
+ROUND: {round_num}
+
+BATCH ASSESSMENT (η² and % proteins affected per field):
+{json.dumps(assessment, indent=2)}
+
+AUTOMATED FIELD DECISIONS:
+{json.dumps(decisions, indent=2)}
+
+REVISED PLAN:
+{json.dumps(revised_plan, indent=2)}
+
+Critically evaluate whether:
+1. Any HIGH/MODERATE field was incorrectly demoted or dropped.
+2. Any LOW/NONE field should be retained (e.g. important known plate variable
+   even if η² is marginal at this sample size).
+3. The recommended method ({revised_plan['recommended_method']}) is appropriate.
+4. There are downstream risks for AD biomarker discovery.
+
+Respond with a concise paragraph (3-5 sentences) of plain-text commentary.
+Do NOT return JSON.
+"""
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    try:
+        return llm.invoke(messages).content.strip()
+    except Exception as exc:
+        return (f"[LLM critique unavailable: {exc}] "
+                "Automated decisions applied without additional LLM review.")
+
+
+def node_reflect_on_assessment(state: BatchCorrectionState) -> BatchCorrectionState:
+    """
+    Reflection agent — sits between node_assess_batch_effects and
+    node_propose_strategy.
+
+    Algorithm
+    ---------
+    For up to _MAX_REFLECT_ROUNDS iterations:
+      1. Classify each confirmed batch field as KEEP / DEMOTE / DROP.
+      2. Build a revised field list and recommended method.
+      3. Ask the LLM to critique the decisions.
+      4. Re-assess any surviving fields on the current df (lightweight η²).
+      5. Stop early if the plan is stable between rounds.
+
+    State changes
+    -------------
+    confirmed_batch_fields   revised list (ComBat candidates only)
+    primary_batch_field      revised primary
+    batch_assessment         updated with any re-assessed values
+    correction_needed        set to False if method == "none"
+    proposed_strategy        pre-filled prior for node_propose_strategy
+    reflection_log           full per-round audit trail
+    agent_reasoning          summary appended
+    """
+    print("\n[NODE 4] Reflection agent reviewing batch assessment...")
+
+    assessment       = dict(state["batch_assessment"])
+    confirmed        = list(state["confirmed_batch_fields"])
+    original_primary = state["primary_batch_field"]
+    protein_cols     = state["protein_cols"]
+    df               = _load_df(state["df_current_path"])
+
+    reflection_log: list[dict] = list(state.get("reflection_log", []))
+    previous_plan   = None
+
+    for round_num in range(1, _MAX_REFLECT_ROUNDS + 1):
+        print(f"\n  [Reflect round {round_num}/{_MAX_REFLECT_ROUNDS}]")
+
+        # 1. Classify each field
+        decisions = [
+            _classify_field_reflect(f, assessment.get(f, {}), f == original_primary)
+            for f in confirmed
+        ]
+        for d in decisions:
+            m = assessment.get(d["field"], {})
+            print(f"    {d['field']:<35} → {d['action']:<25} "
+                  f"(η²={m.get('mean_eta_squared', 0):.4f}, "
+                  f"{m.get('pct_proteins_affected', 0):.1f}%)")
+
+        # 2. Build revised plan
+        revised_plan = _build_revised_plan_reflect(decisions, original_primary)
+
+        # 3. Check convergence
+        if previous_plan is not None:
+            if (sorted(revised_plan["confirmed_batch_fields"]) ==
+                    sorted(previous_plan["confirmed_batch_fields"]) and
+                    revised_plan["recommended_method"] ==
+                    previous_plan["recommended_method"]):
+                print(f"    ✓ Converged after round {round_num}.")
+                break
+
+        # 4. LLM critique
+        commentary = _llm_reflect_critique(assessment, decisions, revised_plan, round_num)
+        print(f"\n    LLM: {commentary[:280]}{'...' if len(commentary) > 280 else ''}")
+
+        # 5. Re-assess survivors to confirm η² still holds
+        survivors = revised_plan["confirmed_batch_fields"]
+        if survivors and round_num < _MAX_REFLECT_ROUNDS:
+            print(f"    Re-assessing {len(survivors)} surviving field(s)...")
+            for field in survivors:
+                new_m = _reassess_field_reflect(df, protein_cols, field)
+                assessment[field] = new_m
+                print(f"      {field}: η²={new_m['mean_eta_squared']:.4f}  "
+                      f"{new_m['pct_proteins_affected']:.1f}%")
+
+        reflection_log.append({
+            "round":          round_num,
+            "decisions":      decisions,
+            "revised_plan":   revised_plan,
+            "llm_commentary": commentary,
+        })
+
+        previous_plan = revised_plan
+        confirmed     = (revised_plan["confirmed_batch_fields"] or
+                         revised_plan["demoted_fields"])
+        if not confirmed:
+            break
+
+    final_plan = revised_plan  # last stable plan
+
+    print(f"\n  [Reflect] Outcome:")
+    print(f"    Method:         {final_plan['recommended_method']}")
+    print(f"    Primary:        {final_plan['primary_batch_field']}")
+    print(f"    ComBat fields:  {final_plan['confirmed_batch_fields']}")
+    print(f"    Demoted:        {final_plan['demoted_fields']}")
+    print(f"    Dropped:        {final_plan['dropped_fields']}")
+
+    # Write back to state
+    state["confirmed_batch_fields"] = final_plan["confirmed_batch_fields"]
+    state["primary_batch_field"]    = final_plan["primary_batch_field"]
+    state["batch_assessment"]       = _sanitise(assessment)
+    state["reflection_log"]         = _sanitise(reflection_log)
+
+    if final_plan["recommended_method"] == "none":
+        state["correction_needed"] = False
+
+    # Pre-fill proposed_strategy as a prior for node_propose_strategy
+    state["proposed_strategy"] = _sanitise({
+        "recommended_method":               final_plan["recommended_method"],
+        "primary_batch_variable":           final_plan["primary_batch_field"],
+        "secondary_batch_variables":        final_plan["demoted_fields"],
+        "biological_covariates_to_protect": ["age", "sex", "AD_case", "apoe_e4"],
+        "dropped_fields":                   final_plan["dropped_fields"],
+        "reflection_reasoning":             final_plan["overall_reasoning"],
+        "pre_correction_steps":             [],
+        "combat_parameters": {
+            "parametric": True, "mean_only": False, "ref_batch": None
+        },
+        "justification":        final_plan["overall_reasoning"],
+        "risks_and_mitigations": [],
+        "validation_checks":    [],
+    })
+
+    state["agent_reasoning"].append(
+        f"[Reflection — {round_num} round(s)] {final_plan['overall_reasoning']} "
+        f"Demoted: {final_plan['demoted_fields']}. "
+        f"Dropped: {final_plan['dropped_fields']}."
+    )
+
+    return state
+
+
+# ================================================================
+# NODE 5: PROPOSE CORRECTION STRATEGY (AI Agent)
 # ================================================================
 
 def node_propose_strategy(state: BatchCorrectionState) -> BatchCorrectionState:
     """
     AI agent analyses batch assessment results and proposes
     a detailed correction strategy with full justification.
+    Uses the reflection agent's prior (state["proposed_strategy"]) as
+    a strong starting point so it does not reinvent the wheel.
     """
-    print("\n[NODE 4] AI agent proposing correction strategy...")
+    print("\n[NODE 5] AI agent proposing correction strategy...")
 
-    assessment = state["batch_assessment"]
-    primary    = state["primary_batch_field"]
+    assessment    = state["batch_assessment"]
+    primary       = state["primary_batch_field"]
+    reflect_prior = state.get("proposed_strategy", {})
 
     llm = get_llm()
 
@@ -623,6 +1090,9 @@ BATCH ASSESSMENT RESULTS:
 
 PRIMARY BATCH FIELD: {primary}
 CORRECTION NEEDED: {state['correction_needed']}
+
+REFLECTION AGENT PRIOR (already validated — use this as your starting point):
+{json.dumps(reflect_prior, indent=2)}
 
 Available correction methods:
 1. ComBat (pyComBat/sva) — Empirical Bayes, gold standard for proteomics
@@ -646,8 +1116,8 @@ CRITICAL RULES:
 - If primary batch field has batches with <10 samples, recommend merging first
 - For multiple batch variables, correct sequentially (primary first)
 
-Based on the assessment, propose a correction strategy.
-Return ONLY valid JSON:
+Based on the assessment and the reflection prior above, confirm or refine the
+correction strategy. Return ONLY valid JSON:
 {{
   "recommended_method": "ComBat|covariate_only|mixed_model|none",
   "primary_batch_variable": "column_name",
@@ -679,8 +1149,8 @@ Return ONLY valid JSON:
                 raw = raw[4:]
         strategy = json.loads(raw.strip())
     except Exception as e:
-        print(f"  LLM strategy proposal failed ({e}), using defaults")
-        strategy = _default_strategy(assessment, primary)
+        print(f"  LLM strategy proposal failed ({e}), using reflection prior")
+        strategy = reflect_prior if reflect_prior else _default_strategy(assessment, primary)
 
     state["proposed_strategy"] = _sanitise(strategy)
     state["agent_reasoning"].append(
@@ -719,6 +1189,7 @@ def human_approve_strategy(state: BatchCorrectionState) -> BatchCorrectionState:
     """
     Human-in-the-loop checkpoint 2.
     Human reviews and approves/modifies the proposed correction strategy.
+    The display now includes the reflection agent's reasoning.
     """
     print("\n" + "="*60)
     print("HUMAN CHECKPOINT 2: Approve Correction Strategy")
@@ -726,6 +1197,7 @@ def human_approve_strategy(state: BatchCorrectionState) -> BatchCorrectionState:
 
     strategy   = state["proposed_strategy"]
     assessment = state["batch_assessment"]
+    refl_log   = state.get("reflection_log", [])
 
     display = f"""
 BATCH EFFECT SUMMARY:
@@ -733,6 +1205,19 @@ BATCH EFFECT SUMMARY:
     for field, metrics in assessment.items():
         display += (f"\n  {field}: {metrics['pct_proteins_affected']:.1f}% proteins affected "
                     f"| η²={metrics['mean_eta_squared']:.4f} | {metrics['severity']}")
+
+    # Include reflection summary if available
+    if refl_log:
+        last_round = refl_log[-1]
+        display += f"""
+
+REFLECTION AGENT SUMMARY ({len(refl_log)} round(s)):
+{"─"*40}"""
+        for d in last_round.get("decisions", []):
+            display += f"\n  {d['field']:<35} → {d['action']} ({d['severity']})"
+        plan = last_round.get("revised_plan", {})
+        display += f"\n  Dropped fields: {plan.get('dropped_fields', [])}"
+        display += f"\n  Demoted to covariate: {plan.get('demoted_fields', [])}"
 
     display += f"""
 
@@ -759,6 +1244,7 @@ Assessment plots saved to: results/batch/
         "checkpoint": "approve_strategy",
         "message":    display,
         "proposed_strategy": strategy,
+        "reflection_summary": refl_log[-1] if refl_log else {},
         "instructions": (
             "Review the proposed strategy. You can: "
             "(1) Approve as-is: respond with {'approved': true} "
@@ -782,13 +1268,12 @@ Assessment plots saved to: results/batch/
         state["approved_strategy"] = approved_strategy
         print(f"  Strategy approved: {approved_strategy.get('recommended_method')}")
     else:
-        # Human rejected — fall back to covariate only
         state["approved_strategy"] = {
             **strategy,
             "recommended_method": "covariate_only",
             "rejection_reason": response_data.get("reason", "Human rejected")
         }
-        print(f"  Strategy rejected. Using covariate_only as fallback.")
+        print("  Strategy rejected. Using covariate_only as fallback.")
 
     state["human_decisions"].append({
         "checkpoint": "approve_strategy",
@@ -800,7 +1285,7 @@ Assessment plots saved to: results/batch/
 
 
 # ================================================================
-# NODE 5: APPLY BATCH CORRECTION
+# NODE 6: APPLY BATCH CORRECTION
 # ================================================================
 
 def node_apply_correction(state: BatchCorrectionState) -> BatchCorrectionState:
@@ -808,7 +1293,7 @@ def node_apply_correction(state: BatchCorrectionState) -> BatchCorrectionState:
     Apply the approved batch correction strategy.
     Supports ComBat (via pyComBat/inmoose) and covariate-only approaches.
     """
-    print("\n[NODE 5] Applying batch correction...")
+    print("\n[NODE 6] Applying batch correction...")
 
     strategy     = state["approved_strategy"]
     df           = _load_df(state["df_current_path"])
@@ -824,7 +1309,7 @@ def node_apply_correction(state: BatchCorrectionState) -> BatchCorrectionState:
         print(f"  Covariate-only: batch field '{batch_col}' retained for use in regression.")
         print("  No data transformation applied.")
     else:
-        print(f"  Unknown method '{method}', defaulting to covariate_only.")
+        print(f"  Method '{method}' — no data transformation applied.")
         df_corrected = df.copy()
 
     state["df_corrected_path"] = _save_df(df_corrected, "df_corrected")
@@ -850,7 +1335,7 @@ def _apply_combat(df, protein_cols, batch_col, protect_vars):
         return df
 
     # Check minimum batch sizes
-    batch_counts = df[batch_col].value_counts()
+    batch_counts  = df[batch_col].value_counts()
     small_batches = batch_counts[batch_counts < 3].index.tolist()
     if small_batches:
         print(f"  WARNING: {len(small_batches)} batches with <3 samples — removing them")
@@ -864,8 +1349,8 @@ def _apply_combat(df, protein_cols, batch_col, protect_vars):
         columns=protein_cols, index=df.index
     )
 
-    batch_labels = df[batch_col].astype(str).values
-    covar_df = None
+    batch_labels  = df[batch_col].astype(str).values
+    covar_df      = None
     valid_protect = [v for v in protect_vars if v in df.columns]
     if valid_protect:
         covar_df = df[valid_protect].fillna(df[valid_protect].median())
@@ -899,17 +1384,18 @@ def _simulate_combat_correction(df, protein_cols, batch_col):
     grand_means  = df[protein_cols].mean()
 
     for batch_val in df[batch_col].unique():
-        mask = df[batch_col] == batch_val
+        mask        = df[batch_col] == batch_val
         batch_means = df.loc[mask, protein_cols].mean()
-        shift = grand_means - batch_means
-        df_corrected.loc[mask, protein_cols] = \
+        shift       = grand_means - batch_means
+        df_corrected.loc[mask, protein_cols] = (
             df.loc[mask, protein_cols] + shift
+        )
 
     return df_corrected
 
 
 # ================================================================
-# NODE 6: VALIDATE CORRECTION
+# NODE 7: VALIDATE CORRECTION
 # ================================================================
 
 def node_validate_correction(state: BatchCorrectionState) -> BatchCorrectionState:
@@ -919,7 +1405,7 @@ def node_validate_correction(state: BatchCorrectionState) -> BatchCorrectionStat
     2. Preserved biological signal (known AD markers still significant)
     3. Did not introduce new artefacts (protein distributions look normal)
     """
-    print("\n[NODE 6] Validating batch correction...")
+    print("\n[NODE 7] Validating batch correction...")
 
     df_raw       = _load_df(state["df_current_path"])
     df_corrected = _load_df(state["df_corrected_path"])
@@ -928,7 +1414,7 @@ def node_validate_correction(state: BatchCorrectionState) -> BatchCorrectionStat
     known_markers= ['NEFL', 'GFAP', 'TREM2', 'CLU', 'APOE', 'APP']
 
     os.makedirs("results/batch", exist_ok=True)
-    metrics = {}
+    metrics    = {}
     plot_paths = []
 
     # --- 1. Batch variance reduction ---
@@ -971,8 +1457,8 @@ def node_validate_correction(state: BatchCorrectionState) -> BatchCorrectionStat
                 controls = df_.loc[df_['AD_case'] == 0, marker].dropna()
                 if len(cases) < 5 or len(controls) < 5:
                     continue
-                _, pval  = stats.ttest_ind(cases, controls)
-                effect   = (cases.mean() - controls.mean()) / df_[marker].std()
+                _, pval = stats.ttest_ind(cases, controls)
+                effect  = (cases.mean() - controls.mean()) / df_[marker].std()
                 store[marker] = {"pvalue": float(pval), "effect_size": float(effect)}
 
         metrics["biological_signal_preservation"] = {
@@ -996,7 +1482,8 @@ def node_validate_correction(state: BatchCorrectionState) -> BatchCorrectionStat
     state["validation_plots"]   = plot_paths
     state["agent_reasoning"].append(
         f"Validation complete. "
-        f"Batch variance reduction: {metrics.get('batch_variance_reduction', {}).get('pct_reduction', 0):.1f}%"
+        f"Batch variance reduction: "
+        f"{metrics.get('batch_variance_reduction', {}).get('pct_reduction', 0):.1f}%"
     )
 
     return state
@@ -1118,15 +1605,12 @@ DECISION REQUIRED:
     })
 
     if decision == "reject":
-        # Route back — in a full implementation this would loop the graph
-        state["final_status"]    = "REJECTED_RETRY"
+        state["final_status"] = "REJECTED_RETRY"
         state["approved_strategy"]["retry_instructions"] = \
             response_data.get("retry_strategy", "")
-        print(f"  Results rejected. Retry instructions: "
-              f"{response_data.get('retry_strategy', 'None provided')}")
+        print(f"  Results rejected. Retry: {response_data.get('retry_strategy', 'None')}")
     elif decision == "partial":
         state["final_status"] = "ACCEPTED_WITH_CAVEATS"
-        # Store caveats in approved_strategy dict (state must stay serialisable)
         state["approved_strategy"]["caveats"] = response_data.get("notes", "")
         print(f"  Partial acceptance. Notes: {response_data.get('notes', '')}")
     else:
@@ -1137,14 +1621,14 @@ DECISION REQUIRED:
 
 
 # ================================================================
-# NODE 7: SAVE OUTPUTS
+# NODE 8: SAVE OUTPUTS
 # ================================================================
 
 def node_save_outputs(state: BatchCorrectionState) -> BatchCorrectionState:
     """
     Save corrected data, audit trail, and summary report.
     """
-    print("\n[NODE 7] Saving outputs...")
+    print("\n[NODE 8] Saving outputs...")
 
     os.makedirs("results/batch", exist_ok=True)
 
@@ -1155,15 +1639,16 @@ def node_save_outputs(state: BatchCorrectionState) -> BatchCorrectionState:
         df_corrected.to_csv(out_path, index=False)
         print(f"  Corrected data: {out_path}")
 
-    # Save audit trail
+    # Save audit trail (includes reflection_log)
     audit = {
-        "pipeline":            "Human-in-the-Loop Batch Correction",
+        "pipeline":            "Human-in-the-Loop Batch Correction (with Reflection Agent)",
         "data_path":           state["data_path"],
         "df_raw_path":         state.get("df_raw_path", ""),
         "df_corrected_path":   state.get("df_corrected_path", ""),
         "confirmed_fields":    state["confirmed_batch_fields"],
         "primary_batch_field": state["primary_batch_field"],
         "batch_assessment":    state["batch_assessment"],
+        "reflection_log":      state.get("reflection_log", []),
         "approved_strategy":   state["approved_strategy"],
         "validation_metrics":  state["validation_metrics"],
         "human_decisions":     state["human_decisions"],
@@ -1175,7 +1660,6 @@ def node_save_outputs(state: BatchCorrectionState) -> BatchCorrectionState:
         json.dump(audit, f, indent=2, default=str)
     print(f"  Audit trail:    {audit_path}")
 
-    # Summary report
     _write_summary_report(state)
 
     return state
@@ -1196,6 +1680,23 @@ def _write_summary_report(state: BatchCorrectionState):
         lines.append(f"- Proteins affected: {metrics['pct_proteins_affected']:.1f}%")
         lines.append(f"- Mean η²: {metrics['mean_eta_squared']:.4f}")
         lines.append(f"- Severity: {metrics['severity']}")
+
+    # Reflection section
+    refl_log = state.get("reflection_log", [])
+    if refl_log:
+        lines.append("\n## Reflection Agent")
+        lines.append(f"\n{len(refl_log)} reflection round(s) completed.")
+        last = refl_log[-1]
+        plan = last.get("revised_plan", {})
+        lines.append(f"\n**Final plan:** {plan.get('overall_reasoning', '')}")
+        lines.append(f"\n**Dropped fields:** {plan.get('dropped_fields', [])}")
+        lines.append(f"\n**Demoted to covariate:** {plan.get('demoted_fields', [])}")
+        lines.append(f"\n**ComBat fields:** {plan.get('confirmed_batch_fields', [])}")
+        for rnd in refl_log:
+            lines.append(f"\n### Round {rnd['round']}")
+            for d in rnd.get("decisions", []):
+                lines.append(f"- {d['field']}: {d['action']} ({d['severity']}) — {d['reasoning']}")
+            lines.append(f"\n*LLM critique:* {rnd.get('llm_commentary', '')}")
 
     lines.append("\n## Correction Strategy")
     strategy = state.get("approved_strategy", {})
@@ -1223,16 +1724,6 @@ def _write_summary_report(state: BatchCorrectionState):
 # ROUTING FUNCTIONS
 # ================================================================
 
-def route_after_detection(state: BatchCorrectionState) -> Literal["human_confirm_batch_fields", END]:
-    if state.get("final_status") == "ERROR":
-        return END
-    return "human_confirm_batch_fields"
-
-
-def route_after_validation(state: BatchCorrectionState) -> Literal["human_accept_results", END]:
-    return "human_accept_results"
-
-
 def route_after_acceptance(state: BatchCorrectionState) -> Literal["node_save_outputs", END]:
     status = state.get("final_status", "ACCEPTED")
     if status == "REJECTED_RETRY":
@@ -1248,14 +1739,27 @@ def build_graph() -> StateGraph:
     """
     Assemble the LangGraph StateGraph with all nodes, edges,
     and human interrupt checkpoints.
+
+    Node order:
+      node_load_data
+      → node_detect_batch_fields
+      ⏸ human_confirm_batch_fields      (INTERRUPT 1)
+      → node_assess_batch_effects
+      → node_reflect_on_assessment      ← reflection agent
+      → node_propose_strategy
+      ⏸ human_approve_strategy          (INTERRUPT 2)
+      → node_apply_correction
+      → node_validate_correction
+      ⏸ human_accept_results            (INTERRUPT 3)
+      → node_save_outputs
     """
     graph = StateGraph(BatchCorrectionState)
 
-    # Add all nodes
     graph.add_node("node_load_data",             node_load_data)
     graph.add_node("node_detect_batch_fields",   node_detect_batch_fields)
     graph.add_node("human_confirm_batch_fields", human_confirm_batch_fields)
     graph.add_node("node_assess_batch_effects",  node_assess_batch_effects)
+    graph.add_node("node_reflect_on_assessment", node_reflect_on_assessment)
     graph.add_node("node_propose_strategy",      node_propose_strategy)
     graph.add_node("human_approve_strategy",     human_approve_strategy)
     graph.add_node("node_apply_correction",      node_apply_correction)
@@ -1263,8 +1767,7 @@ def build_graph() -> StateGraph:
     graph.add_node("human_accept_results",       human_accept_results)
     graph.add_node("node_save_outputs",          node_save_outputs)
 
-    # Edges
-    graph.add_edge(START,                             "node_load_data")
+    graph.add_edge(START, "node_load_data")
     graph.add_conditional_edges(
         "node_load_data",
         lambda s: END if s.get("final_status") == "ERROR" else "node_detect_batch_fields",
@@ -1272,14 +1775,15 @@ def build_graph() -> StateGraph:
     )
     graph.add_edge("node_detect_batch_fields",        "human_confirm_batch_fields")
     graph.add_edge("human_confirm_batch_fields",      "node_assess_batch_effects")
-    graph.add_edge("node_assess_batch_effects",       "node_propose_strategy")
+    graph.add_edge("node_assess_batch_effects",       "node_reflect_on_assessment")
+    graph.add_edge("node_reflect_on_assessment",      "node_propose_strategy")
     graph.add_edge("node_propose_strategy",           "human_approve_strategy")
     graph.add_edge("human_approve_strategy",          "node_apply_correction")
     graph.add_edge("node_apply_correction",           "node_validate_correction")
     graph.add_edge("node_validate_correction",        "human_accept_results")
     graph.add_conditional_edges("human_accept_results", route_after_acceptance,
-                                  ["node_save_outputs", END])
-    graph.add_edge("node_save_outputs",               END)
+                                 ["node_save_outputs", END])
+    graph.add_edge("node_save_outputs", END)
 
     return graph
 
@@ -1291,12 +1795,14 @@ def create_pipeline() -> tuple:
     """
     graph    = build_graph()
     memory   = MemorySaver()
-    compiled = graph.compile(checkpointer=memory,
-                               interrupt_before=[
-                                   "human_confirm_batch_fields",
-                                   "human_approve_strategy",
-                                   "human_accept_results"
-                               ])
+    compiled = graph.compile(
+        checkpointer=memory,
+        interrupt_before=[
+            "human_confirm_batch_fields",
+            "human_approve_strategy",
+            "human_accept_results",
+        ]
+    )
     return compiled, memory
 
 
@@ -1307,15 +1813,14 @@ def create_pipeline() -> tuple:
 def run_pipeline(data_path: str, thread_id: str = "batch_correction_01"):
     """
     Run the full human-in-the-loop batch correction pipeline.
-    At each human checkpoint, the pipeline suspends via interrupt(),
+    At each human checkpoint the pipeline suspends via interrupt(),
     prints the decision context, waits for terminal input, then resumes.
     """
-    from langgraph.types import Command   # import here to avoid circular issues
+    from langgraph.types import Command
 
     pipeline, _ = create_pipeline()
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Initial state — only serialisable primitives; no DataFrames
     initial_state = BatchCorrectionState(
         data_path=data_path,
         df_raw_path="", df_current_path="",
@@ -1324,6 +1829,7 @@ def run_pipeline(data_path: str, thread_id: str = "batch_correction_01"):
         primary_batch_field="",
         batch_assessment={}, assessment_plots=[],
         correction_needed=False,
+        reflection_log=[],
         proposed_strategy={}, approved_strategy={},
         df_corrected_path="",
         validation_metrics={}, validation_plots=[],
@@ -1334,28 +1840,21 @@ def run_pipeline(data_path: str, thread_id: str = "batch_correction_01"):
 
     print("\n" + "="*60)
     print("STARTING: Human-in-the-Loop Batch Correction Pipeline")
+    print("         (Reflection Agent enabled)")
     print("="*60)
 
     def _stream_until_interrupt(input_val):
-        """Stream events until the graph suspends or finishes."""
-        for event in pipeline.stream(input_val, config, stream_mode="values"):
-            # stream_mode="values" yields full state snapshots; skip printing here
+        for _ in pipeline.stream(input_val, config, stream_mode="values"):
             pass
+        return pipeline.get_state(config)
 
-        graph_state = pipeline.get_state(config)
-        return graph_state
-
-    # --- First run — executes until first interrupt ---
     graph_state = _stream_until_interrupt(initial_state)
 
-    # --- Loop: handle each human checkpoint then resume ---
     while graph_state.next:
         next_node = graph_state.next[0]
         print(f"\n  ⏸  PAUSED before: {next_node}")
 
-        # Extract the interrupt payload
         interrupt_val = _get_interrupt_value(graph_state)
-
         if interrupt_val and isinstance(interrupt_val, dict):
             print("\n" + "─"*60)
             print(interrupt_val.get("message", ""))
@@ -1367,7 +1866,6 @@ def run_pipeline(data_path: str, thread_id: str = "batch_correction_01"):
         if not human_input:
             human_input = '{"approved": true}'
 
-        # Resume graph with human input
         graph_state = _stream_until_interrupt(Command(resume=human_input))
 
     final_state = pipeline.get_state(config).values
@@ -1380,8 +1878,7 @@ def run_pipeline(data_path: str, thread_id: str = "batch_correction_01"):
 def _get_interrupt_value(state):
     """Extract interrupt payload from graph state."""
     try:
-        tasks = state.tasks
-        for task in tasks:
+        for task in state.tasks:
             if hasattr(task, 'interrupts') and task.interrupts:
                 return task.interrupts[0].value
     except Exception:

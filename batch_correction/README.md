@@ -10,6 +10,8 @@ OLINK proximity extension assays measure protein abundance as NPX (Normalised Pr
 
 The pipeline is **human-in-the-loop**: an AI agent handles detection and strategy proposal, but a researcher reviews and approves decisions at three critical checkpoints before any data is modified.
 
+A **reflection agent** (`node_reflect_on_assessment`) adds a self-correcting loop between batch assessment and strategy proposal. It automatically prunes fields with no meaningful batch effect, demotes marginal fields to regression covariates, and pre-fills a validated correction strategy — so the human checkpoint always shows a clean, evidence-backed plan rather than raw LLM output.
+
 ---
 
 ## Pipeline Architecture
@@ -18,31 +20,34 @@ The pipeline is **human-in-the-loop**: an AI agent handles detection and strateg
 START
   │
   ▼
-[1] node_load_data             — load CSV, classify protein vs. metadata columns
+[1] node_load_data              — load CSV, classify protein vs. metadata columns
   │
   ▼
-[2] node_detect_batch_fields   — LLM classifies metadata columns by batch relevance
+[2] node_detect_batch_fields    — LLM classifies metadata columns by batch relevance
   │
   ⏸ CHECKPOINT 1: human_confirm_batch_fields
   │
   ▼
-[3] node_assess_batch_effects  — compute η² per field, generate PCA plots
+[3] node_assess_batch_effects   — compute η² per field, generate PCA plots
   │
   ▼
-[4] node_propose_strategy      — LLM recommends correction method with justification
+[4] node_reflect_on_assessment  — ★ reflection agent: prune / demote / drop fields
+  │                                 with no batch signal; pre-fill strategy prior
+  ▼
+[5] node_propose_strategy       — LLM confirms / refines the reflection prior
   │
   ⏸ CHECKPOINT 2: human_approve_strategy
   │
   ▼
-[5] node_apply_correction      — pyComBat or covariate-only correction
+[6] node_apply_correction       — pyComBat or covariate-only correction
   │
   ▼
-[6] node_validate_correction   — η² reduction, AD marker signal preservation
+[7] node_validate_correction    — η² reduction, AD marker signal preservation
   │
   ⏸ CHECKPOINT 3: human_accept_results
   │
   ▼
-[7] node_save_outputs          — corrected CSV, audit trail, markdown report
+[8] node_save_outputs           — corrected CSV, audit trail, markdown report
   │
   ▼
  END
@@ -53,12 +58,66 @@ START
 
 ---
 
+## Reflection Agent
+
+`node_reflect_on_assessment` runs automatically after `node_assess_batch_effects`
+and before any strategy is proposed. It removes the need for the LLM or the human
+to manually filter out spurious batch fields.
+
+### What it does
+
+For each confirmed batch field it applies the same thresholds used during
+assessment:
+
+| η² | % proteins | Severity | Decision | Outcome |
+|---|---|---|---|---|
+| ≥ 0.05 | ≥ 30% | HIGH | KEEP | Enters ComBat as primary/secondary |
+| ≥ 0.01 | ≥ 10% | MODERATE | KEEP | Enters ComBat |
+| ≥ 0.001 | ≥ 2% | LOW | DEMOTE | Regression covariate only; no ComBat |
+| < 0.001 | < 2% | NONE | DROP | Excluded entirely |
+
+If no field survives the KEEP threshold, the overall strategy automatically
+falls back to `covariate_only` or `none`, and `correction_needed` is set to
+`False`.
+
+### Reflection loop
+
+The agent iterates up to three times (configurable via `_MAX_REFLECT_ROUNDS`):
+
+1. Classify each confirmed field.
+2. Build a revised field list and recommended method.
+3. Ask the LLM to critique the decisions (flags any incorrect demotions or
+   missed risks for AD biomarker analysis).
+4. Re-assess surviving fields on the current DataFrame to confirm their
+   η² still holds.
+5. Stop early if the plan is stable between consecutive rounds.
+
+The full per-round log is stored in `state["reflection_log"]` and written to
+`audit_trail.json` and `correction_report.md`.
+
+### What the human sees at Checkpoint 2
+
+The strategy approval screen now includes a **Reflection Agent Summary**
+section listing each field's final decision (KEEP / DEMOTE / DROP) and the
+reason, alongside the proposed correction method. Dropped and demoted fields
+are shown explicitly so the researcher can override if domain knowledge warrants it.
+
+### Running standalone
+
+The reflection logic can be run independently without LangGraph for debugging:
+
+```bash
+python batch_correction_reflection_agent.py data/simulated_batch_olink.csv
+```
+
+---
+
 ## Human Checkpoints
 
 | Checkpoint | What the human decides |
 |---|---|
 | **1 — Confirm batch fields** | Review AI-detected batch-relevant columns; select primary batch variable for ComBat |
-| **2 — Approve strategy** | Accept, modify, or reject the proposed correction method and parameters |
+| **2 — Approve strategy** | Review reflection summary (dropped/demoted fields) and proposed method; accept, modify, or reject |
 | **3 — Accept results** | Review η² reduction and AD marker preservation; accept, flag caveats, or reject |
 
 ---
@@ -108,19 +167,21 @@ Thread IDs must match the original run for LangGraph's `MemorySaver` to restore 
 
 ```
 batch_correction/
-├── CLAUDE.md                        ← project constraints and conventions
-├── batch_correction_agent.py        ← LangGraph graph, all nodes, state
-├── run_pipeline.py                  ← CLI entry point, demo mode fallback
-├── simulate_data.py                 ← synthetic UKB OLINK data generator
+├── CLAUDE.md                            ← project constraints and conventions
+├── batch_correction_agent.py            ← LangGraph graph, all nodes, state
+│                                           (reflection node fully integrated)
+├── batch_correction_reflection_agent.py ← standalone reflection module
+├── run_pipeline.py                      ← CLI entry point, demo mode fallback
+├── simulate_data.py                     ← synthetic UKB OLINK data generator
 ├── requirements.txt
 ├── data/
-│   └── simulated_batch_olink.csv    ← generated by simulate_data.py
+│   └── simulated_batch_olink.csv        ← generated by simulate_data.py
 └── results/
     └── batch/
-        ├── cache/                   ← TRANSIENT: parquet cache (do not commit)
+        ├── cache/                       ← TRANSIENT: parquet cache (do not commit)
         ├── olink_batch_corrected.csv
-        ├── audit_trail.json
-        ├── correction_report.md
+        ├── audit_trail.json             ← includes reflection_log
+        ├── correction_report.md         ← includes reflection section
         ├── pca_before.png
         ├── pca_after.png
         └── before_after_comparison.png
@@ -135,8 +196,8 @@ batch_correction/
 | File | Description |
 |---|---|
 | `olink_batch_corrected.csv` | Final corrected protein NPX matrix with metadata |
-| `audit_trail.json` | Complete record of batch assessment, strategy, validation, and human decisions |
-| `correction_report.md` | Human-readable summary of the entire run |
+| `audit_trail.json` | Complete record of batch assessment, reflection log, strategy, validation, and human decisions |
+| `correction_report.md` | Human-readable summary including reflection agent decisions |
 | `pca_before.png` / `pca_after.png` | PCA coloured by primary batch field, before and after correction |
 | `before_after_comparison.png` | Side-by-side PCA comparison |
 
@@ -144,13 +205,15 @@ batch_correction/
 
 ## Batch Severity Thresholds
 
-The pipeline uses η² (eta-squared) — the proportion of protein variance explained by batch — to classify severity and recommend action.
+Used identically by `node_assess_batch_effects` and the reflection agent.
+Do not change one without changing the other.
 
-| Mean η² | Proteins affected | Severity | Action |
-|---|---|---|---|
-| < 0.01 | < 10% | Low | Include batch as covariate in regression |
-| 0.01–0.05 | 10–30% | Moderate | ComBat recommended |
-| > 0.05 | > 30% | High | ComBat required |
+| Mean η² | Proteins affected | Severity | Reflection decision | Correction action |
+|---|---|---|---|---|
+| ≥ 0.05 | ≥ 30% | High | KEEP | ComBat required |
+| ≥ 0.01 | ≥ 10% | Moderate | KEEP | ComBat recommended |
+| ≥ 0.001 | ≥ 2% | Low | DEMOTE to covariate | Include in regression only |
+| < 0.001 | < 2% | None | DROP | Exclude entirely |
 
 ---
 
@@ -158,7 +221,7 @@ The pipeline uses η² (eta-squared) — the proportion of protein variance expl
 
 ### ComBat (default for moderate/high severity)
 
-Uses [`inmoose.pycombat.pycombat_norm`](https://github.com/epigenelabs/inmoose), an empirical Bayes method that models and removes additive and multiplicative batch effects.
+Uses [`inmoose.pycombat.pycombat_norm`](https://github.com/epigenelabs/inmoose), an empirical Bayes method that models and removes additive and multiplicative batch effects. Only applied to fields the reflection agent classifies as KEEP.
 
 **Critical:** biological covariates (`age`, `sex`, `AD_case`, `apoe_e4`) are always passed as `covar_mod` to prevent ComBat from treating case-control differences as batch noise.
 
@@ -170,9 +233,9 @@ corrected = pycombat_norm(
 )
 ```
 
-### Covariate-only (for low severity)
+### Covariate-only (for low severity, or when reflection demotes all fields)
 
-No transformation is applied to the data. The batch field is retained as a covariate for inclusion in downstream regression models.
+No transformation is applied to the data. Surviving batch fields are retained as covariates for inclusion in downstream regression models.
 
 ---
 
@@ -184,11 +247,10 @@ The order of steps is strict and must not be changed:
 2. **Outlier winsorisation** — clip at ± 4 SD per protein  
 3. **Imputation** — median imputation for residual NAs  
 4. **Batch effect detection** — assess η² on the clean, complete matrix  
-5. **Batch correction (ComBat)** — correct on pre-INT values  
-6. **Rank-based INT** — apply inverse normal transformation *after* correction  
-7. **Association testing** — logistic regression or Cox proportional hazards  
-
-> Applying INT before ComBat destroys the additive/multiplicative batch structure that ComBat models. Applying ComBat before imputation will fail because ComBat requires a complete matrix.
+5. **Reflection** — prune fields with no batch signal before strategy is set  
+6. **Batch correction (ComBat)** — correct on pre-INT values  
+7. **Rank-based INT** — apply inverse normal transformation *after* correction  
+8. **Association testing** — logistic regression or Cox proportional hazards  
 
 ---
 
@@ -212,29 +274,21 @@ Reliable sources: HES inpatient (11), HES outpatient (51), GP records (61). Self
 
 ---
 
-## LangGraph State Constraints
+## LangGraph State
 
-LangGraph's `MemorySaver` serialises state to msgpack at every checkpoint. DataFrames and numpy types are not serialisable. This project enforces two patterns throughout:
-
-**DataFrames — never stored in state directly:**
-
-```python
-# Wrong — crashes at checkpoint
-state["df"] = my_dataframe
-
-# Correct — save to parquet, store path string
-state["df_path"] = _save_df(my_dataframe, "df_name")
-df = _load_df(state["df_path"])  # reload in next node
-```
-
-**Numpy scalars — always sanitised before storing:**
+`BatchCorrectionState` is a `TypedDict`. All fields must be plain Python
+primitives (no DataFrames, no numpy types). The reflection agent adds one new
+field:
 
 ```python
-state["metrics"] = _sanitise(my_metrics_dict)
-# _sanitise() converts np.bool_ → bool, np.integer → int, etc.
+reflection_log: list[dict]   # per-round audit trail from the reflection node
 ```
 
-Common traps: `df[col].nunique() < 50` produces `np.bool_` — wrap in `bool()`. `np.mean(arr) > threshold` also produces `np.bool_`.
+Always initialise `reflection_log=[]` in `initial_state`. Each entry records
+the round number, per-field decisions, the revised plan, and the LLM critique.
+
+For the full msgpack serialisation rules, the `_sanitise()` helper, and the
+parquet cache pattern, see **CLAUDE.md §Critical constraints**.
 
 ---
 
@@ -246,7 +300,9 @@ Common traps: `df[col].nunique() < 50` produces `np.bool_` — wrap in `bool()`.
 | Temperature | `0.1` (low, for analytical consistency) |
 | Max tokens | `2048` |
 
-Both LLM nodes (`node_detect_batch_fields`, `node_propose_strategy`) have heuristic fallbacks that activate on API failure or unparseable JSON. The pipeline always completes in demo mode without an API key.
+LLM nodes: `node_detect_batch_fields`, `node_reflect_on_assessment` (critique
+only), `node_propose_strategy`. All have heuristic fallbacks — the pipeline
+always completes in demo mode without an API key.
 
 ---
 
@@ -262,6 +318,10 @@ Both LLM nodes (`node_detect_batch_fields`, `node_propose_strategy`) have heuris
 - **Sample quality flags** (haemolysis, lipaemia)
 - **AD biological signal** on 10 known markers (NEFL, GFAP, TREM2, APP, CLU, CR1, BIN1, PICALM, APOE, ADAM10) with effect size ~0.7 NPX
 
+The reflection agent is expected to KEEP `plate_id` (HIGH effect), KEEP or
+DEMOTE `assessment_centre`, and DEMOTE or DROP `freeze_thaw_cycles` and
+`sample_quality_flag` (LOW/NONE effect in the simulated data).
+
 ---
 
 ## Known Issues
@@ -271,6 +331,8 @@ Both LLM nodes (`node_detect_batch_fields`, `node_propose_strategy`) have heuris
 **Small batches:** ComBat requires ≥ 3 samples per batch for variance estimation. Batches below this threshold are removed before correction. If many batches are small after QC filtering, consider merging by collection date before running.
 
 **Parquet dtype drift:** Reloading from the parquet cache may change dtype slightly (e.g. `Int64` → `float64` where NAs are present). This is expected pandas/parquet behaviour and does not affect downstream analysis.
+
+**Reflection convergence:** The loop exits when classifications are stable or after `_MAX_REFLECT_ROUNDS` (3). If all three rounds run without converging, verify the protein sample size (`sample_n=150` by default) is sufficient for stable η² estimates at your dataset size.
 
 ---
 
