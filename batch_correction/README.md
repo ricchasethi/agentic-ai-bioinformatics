@@ -93,7 +93,7 @@ The agent iterates up to three times (configurable via `_MAX_REFLECT_ROUNDS`):
 5. Stop early if the plan is stable between consecutive rounds.
 
 The full per-round log is stored in `state["reflection_log"]` and written to
-`audit_trail.json` and `correction_report.md`.
+`results/batch/audit_trail.json` and `results/batch/correction_report.md`.
 
 ### What the human sees at Checkpoint 2
 
